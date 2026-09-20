@@ -10,8 +10,6 @@ class SearchError(RuntimeError):
 
 
 class CheapTripSearchService:
-    """Find the cheapest valid round-trip combination for each destination."""
-
     def __init__(self, provider=None):
         self.provider = provider or FastFlightsProvider()
 
