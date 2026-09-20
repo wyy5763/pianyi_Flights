@@ -14,8 +14,6 @@ class ProviderError(RuntimeError):
 
 
 class FastFlightsProvider:
-    """fast-flights adapter. Provider-specific parsing is isolated here."""
-
     def __init__(self, language: str = "zh-CN"):
         self.language = language
 
@@ -42,39 +40,16 @@ class FastFlightsProvider:
             raise ProviderError(f"航班数据源请求失败：{exc}") from exc
 
     @staticmethod
-    def _number(value: Any) -> float | None:
-        if value is None or isinstance(value, bool):
-            return None
-        if isinstance(value, (int, float)):
-            return float(value)
-        text = str(value).replace(",", "").replace("¥", "").replace("CNY", "").strip()
-        try:
-            return float(text)
-        except ValueError:
-            return None
+    def _extract_min_price(result: Any) -> float | None:
+        prices: list[float] = []
+        items = result if isinstance(result, (list, tuple)) else [result]
 
-    def _extract_min_price(self, result: Any) -> float | None:
-        candidates: list[float] = []
+        for item in items:
+            value = item.get("price") if isinstance(item, dict) else getattr(item, "price", None)
+            if isinstance(value, (int, float)) and value > 0:
+                prices.append(float(value))
 
-        def walk(obj: Any, depth: int = 0):
-            if depth > 6 or len(candidates) >= 50:
-                return
-            if isinstance(obj, dict):
-                for key, value in obj.items():
-                    key_lower = str(key).lower()
-                    if any(token in key_lower for token in ("price", "fare", "amount", "total")):
-                        number = self._number(value)
-                        if number is not None and 1 <= number <= 200000:
-                            candidates.append(number)
-                    walk(value, depth + 1)
-            elif isinstance(obj, (list, tuple)):
-                for item in obj[:100]:
-                    walk(item, depth + 1)
-            elif hasattr(obj, "__dict__"):
-                walk(vars(obj), depth + 1)
-
-        walk(result)
-        return min(candidates) if candidates else None
+        return min(prices) if prices else None
 
     def one_way_min(self, origin: str, destination: str, when: date) -> Fare:
         result = self._query(origin, destination, when)
