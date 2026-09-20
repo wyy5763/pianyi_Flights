@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
+import time
 
 from app.core.models import Fare, RoundTripDeal
 from app.data.airports import destinations_for, resolve_origin
@@ -10,8 +12,17 @@ class SearchError(RuntimeError):
 
 
 class CheapTripSearchService:
-    def __init__(self, provider=None):
+    def __init__(
+        self,
+        provider=None,
+        max_workers: int = 6,
+        max_retries: int = 2,
+        retry_delay: float = 0.6,
+    ):
         self.provider = provider or FastFlightsProvider()
+        self.max_workers = max(1, min(max_workers, 12))
+        self.max_retries = max(0, min(max_retries, 5))
+        self.retry_delay = max(0.0, retry_delay)
 
     @staticmethod
     def _date_pairs(start: date, days_ahead: int, min_days: int, max_days: int):
@@ -27,33 +38,71 @@ class CheapTripSearchService:
     def _required_dates(
         start: date, days_ahead: int, min_days: int, max_days: int
     ) -> tuple[list[date], list[date]]:
-        """
-        Return the unique outbound and inbound dates needed by all valid pairs.
-
-        This is the main V1 performance optimization: a flight leg such as
-        SHE->PEK on a given day can participate in several different return
-        combinations, so it must only be fetched once per search.
-        """
         pairs = list(
             CheapTripSearchService._date_pairs(
                 start, days_ahead, min_days, max_days
             )
         )
-        outbound_dates = sorted({departure for departure, _ in pairs})
-        inbound_dates = sorted({return_date for _, return_date in pairs})
-        return outbound_dates, inbound_dates
+        return (
+            sorted({departure for departure, _ in pairs}),
+            sorted({return_date for _, return_date in pairs}),
+        )
 
-    def _get_one_way(
+    def _fetch_one(
         self,
-        cache: dict[tuple[str, str, date], Fare],
         origin: str,
         destination: str,
         when: date,
-    ) -> Fare:
-        key = (origin, destination, when)
-        if key not in cache:
-            cache[key] = self.provider.one_way_min(origin, destination, when)
-        return cache[key]
+    ) -> tuple[tuple[str, str, date], Fare | None]:
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return (
+                    (origin, destination, when),
+                    self.provider.one_way_min(origin, destination, when),
+                )
+            except ProviderError as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    time.sleep(self.retry_delay * (attempt + 1))
+        return ((origin, destination, when), None)
+
+    def _load_legs(
+        self,
+        origin_code: str,
+        destinations,
+        outbound_dates: list[date],
+        inbound_dates: list[date],
+    ) -> tuple[dict[tuple[str, str, date], Fare], int]:
+        keys = {
+            (origin_code, destination.code, when)
+            for destination in destinations
+            for when in outbound_dates
+        }
+        keys.update(
+            {
+                (destination.code, origin_code, when)
+                for destination in destinations
+                for when in inbound_dates
+            }
+        )
+
+        cache: dict[tuple[str, str, date], Fare] = {}
+        failed = 0
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = [
+                executor.submit(self._fetch_one, origin, destination, when)
+                for origin, destination, when in sorted(keys)
+            ]
+            for future in as_completed(futures):
+                key, fare = future.result()
+                if fare is None:
+                    failed += 1
+                else:
+                    cache[key] = fare
+
+        return cache, failed
 
     def search(
         self,
@@ -67,6 +116,8 @@ class CheapTripSearchService:
     ):
         if currency != "CNY":
             raise SearchError("V1 当前只支持 CNY")
+        if days_ahead < 1:
+            raise SearchError("days_ahead 必须大于等于 1")
         if max_trip_days < min_trip_days:
             raise SearchError("max_trip_days 必须大于等于 min_trip_days")
 
@@ -76,52 +127,36 @@ class CheapTripSearchService:
             raise SearchError(str(exc)) from exc
 
         today = date.today()
-        deals: list[RoundTripDeal] = []
-        cache: dict[tuple[str, str, date], Fare] = {}
+        destinations = destinations_for(origin_airport, max_destinations)
+        if not destinations:
+            raise SearchError("没有可搜索的目的地")
 
         outbound_dates, inbound_dates = self._required_dates(
             today, days_ahead, min_trip_days, max_trip_days
         )
+        cache, failed_leg_count = self._load_legs(
+            origin_airport.code,
+            destinations,
+            outbound_dates,
+            inbound_dates,
+        )
 
-        for destination in destinations_for(origin_airport, max_destinations):
-            # Fetch each unique flight leg once, then combine cached fares
-            # locally across all valid departure/return date pairs.
-            for departure in outbound_dates:
-                try:
-                    self._get_one_way(
-                        cache,
-                        origin_airport.code,
-                        destination.code,
-                        departure,
-                    )
-                except ProviderError:
-                    continue
+        deals: list[RoundTripDeal] = []
+        candidate_pair_count = 0
 
-            for return_date in inbound_dates:
-                try:
-                    self._get_one_way(
-                        cache,
-                        destination.code,
-                        origin_airport.code,
-                        return_date,
-                    )
-                except ProviderError:
-                    continue
-
+        for destination in destinations:
             best = None
             for departure, return_date in self._date_pairs(
                 today, days_ahead, min_trip_days, max_trip_days
             ):
-                try:
-                    outbound = cache[
-                        (origin_airport.code, destination.code, departure)
-                    ]
-                    inbound = cache[
-                        (destination.code, origin_airport.code, return_date)
-                    ]
-                except KeyError:
-                    # A provider failure for either leg makes this combination
-                    # unavailable; never invent or estimate a fare.
+                candidate_pair_count += 1
+                outbound = cache.get(
+                    (origin_airport.code, destination.code, departure)
+                )
+                inbound = cache.get(
+                    (destination.code, origin_airport.code, return_date)
+                )
+                if outbound is None or inbound is None:
                     continue
 
                 total = round(outbound.price + inbound.price, 2)
@@ -141,7 +176,15 @@ class CheapTripSearchService:
                     currency=currency,
                     price_source="outbound + inbound",
                 )
-                if best is None or deal.round_trip_price < best.round_trip_price:
+                if best is None or (
+                    deal.round_trip_price,
+                    deal.trip_days,
+                    deal.departure_date,
+                ) < (
+                    best.round_trip_price,
+                    best.trip_days,
+                    best.departure_date,
+                ):
                     best = deal
 
             if best:
@@ -152,6 +195,7 @@ class CheapTripSearchService:
                 item.round_trip_price,
                 item.trip_days,
                 item.departure_date,
+                item.destination_code,
             )
         )
 
@@ -162,6 +206,14 @@ class CheapTripSearchService:
             "currency": currency,
             "search_window_days": days_ahead,
             "trip_days": {"min": min_trip_days, "max": max_trip_days},
+            "search_stats": {
+                "destinations_checked": len(destinations),
+                "candidate_round_trips": candidate_pair_count,
+                "unique_leg_queries": len(cache) + failed_leg_count,
+                "successful_leg_queries": len(cache),
+                "failed_leg_queries": failed_leg_count,
+                "max_workers": self.max_workers,
+            },
             "results": [
                 {
                     "origin_code": item.origin_code,
